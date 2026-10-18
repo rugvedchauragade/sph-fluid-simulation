@@ -1,0 +1,341 @@
+import Config
+import pygame, math, random
+import matplotlib.cm as cm
+
+positions = []
+velocities = []
+
+outlets=[]
+drains = []
+
+cmap = cm.get_cmap(Config.color_scheme)
+
+grid_cols = (Config.HEIGHT//Config.grid_size) + 1
+grid_rows = (Config.WIDTH//Config.grid_size) + 1
+
+
+def initialize_grid():
+    return [[[] for _ in range(grid_rows)] for _ in range(grid_cols)]
+
+def look_up_grid(particle_pos):
+    x = int(particle_pos.x // Config.grid_size)
+    y = int(particle_pos.y // Config.grid_size)
+    x = max(0, min(x, grid_rows - 1))
+    y = max(0, min(y, grid_cols - 1))
+    return y,x
+
+def register_grid(cell_belonging, i, grids):
+    r, c = cell_belonging
+    grids[r][c].append(i)
+    return grids
+
+def draw_grid(win):
+    for x in range(0, Config.WIDTH, Config.grid_size):
+        pygame.draw.line(win, (0,100,0), (x,0), (x,Config.HEIGHT), 1)
+    for y in range(0, Config.HEIGHT, Config.grid_size):
+        pygame.draw.line(win, (0,100,0), (0,y), (Config.WIDTH,y), 1)
+
+
+# poly6: (315/64*math.pi*h^9 * (h^2 - r^2)^3) if 0 <=r <= h else 0
+# spiky: (15/ math.pi*h^6) * (h - r)^3 if 0<= r <= h else 0
+# all these equations: from scientific paper
+
+def smoothing_kernel(r,h):
+    #spiky
+    if 0 <= r <= h:
+        return (15 / (math.pi * h**6)) * (h - r)**3
+    return 0
+
+def laplacian_kernel(r_len,h):
+    # for viscosity, DO NOT use spiky laplacian. this is separate kernel
+    if r_len>=h:
+        return 0
+    return (45/(math.pi * h**6)) * (h - r_len)
+
+def kernel_gradient(r_vec:pygame.Vector2,h):
+    # spiky gradient
+    r = r_vec.length()
+    if r>=h or r==0:
+        return r_vec*0.0
+    k = -45 / (math.pi * h**6)
+    return k * (h-r)**2 * (r_vec/r)
+
+
+def calculate_density(particle_index:int, grids):
+    density = 0
+    pos_i = positions[particle_index]
+    row, col = look_up_grid(pos_i)
+    for dr in (-1,0,1):
+        for dc in (-1,0,1):
+            r_cell = row + dr
+            c_cell = col + dc
+            if 0<= r_cell < grid_cols and 0<=c_cell < grid_rows:
+                for j in grids[r_cell][c_cell]:
+                    dst = (pos_i - positions[j]).length()
+                    density += Config.mass * smoothing_kernel(dst, Config.smoothing_radius)
+    return density
+
+def pressure_from_density(particle_index:int, densities:list):
+    raw = Config.stiffness_constant * (densities[particle_index] - Config.target_density)
+    return max(0.0, raw) # clamp so particles don't attract via negative pressure
+
+def acc_from_pressure(particle_index:int, densities:list, pressures:list, grids):
+    a = pygame.Vector2((0,0))
+    pos_i = positions[particle_index]
+    rho_i = max(densities[particle_index], 1e-8)
+    p_i = pressures[particle_index]
+
+    row, col = look_up_grid(positions[particle_index])
+    for dr in (-1,0,1):
+        for dc in (-1,0,1):
+            r_cell = row + dr
+            c_cell = col + dc
+            if 0<= r_cell < grid_cols and 0<=c_cell < grid_rows:
+                for j in grids[r_cell][c_cell]:
+                    if particle_index==j: continue
+                    pos_j = positions[j]
+                    r_vec = pos_i - pos_j
+
+                    rho_j = max(densities[j], 1e-8)
+                    p_j = pressures[j]
+
+                    grad = kernel_gradient(r_vec, Config.smoothing_radius)
+
+                    shared_pressure = ((p_i / (rho_i*rho_i)) + (p_j / (rho_j*rho_j)))
+
+                    # SPH pressure acceleration: a_i = - \nabla W weighted sum
+                    a -= Config.mass * shared_pressure * grad
+    return a
+
+def acc_from_viscosity(particle_index:int, densities:list, velocities:list, grids):
+    a = pygame.Vector2((0,0))
+    vi = velocities[particle_index]
+    pos_i = positions[particle_index]
+
+    row, col = look_up_grid(positions[particle_index])
+    for dr in (-1,0,1):
+        for dc in (-1,0,1):
+            r_cell = row + dr
+            c_cell = col + dc
+            if 0<= r_cell < grid_cols and 0<=c_cell < grid_rows:
+                for j in grids[r_cell][c_cell]:
+                    if particle_index==j: continue
+                    r = (pos_i - positions[j]).length()
+                    vj = velocities[j]
+                    rho_j = max(densities[j], 1e-8)
+                    v_rel = vi-vj
+                    a += Config.mass * v_rel/rho_j * laplacian_kernel(r, Config.smoothing_radius)
+
+    return a*Config.viscosity_strength
+
+
+def update(win, acc_ext, mouse_pos):
+    N = len(positions)
+    if N == 0:
+        return
+
+    grids = initialize_grid()
+    for i in range(N):
+        cell_belonging = look_up_grid(positions[i])
+        grids = register_grid(cell_belonging, i, grids)
+
+    densities = [calculate_density(i, grids) for i in range(N)]
+    pressures = [pressure_from_density(i, densities) for i in range(N)]
+
+    accelerations = []
+    for i in range(N):
+        a = acc_from_pressure(i, densities, pressures, grids)
+        a += acc_from_viscosity(i, densities, velocities, grids)
+        a += acc_ext # gravity
+        if Config.interaction_strength != 0:
+            a += interaction_force(mouse_pos, Config.interaction_radius, Config.interaction_strength, i)
+        accelerations.append(a)
+
+    # semi-implicit integration: compute candidate velocities, apply XSPH mixing, then update positions
+    new_vels = []
+    for i in range(N):
+        v_new = velocities[i] + accelerations[i] * Config.delta
+        v_new = clamp_velocity(v_new, Config.max_speed)
+        new_vels.append(v_new)
+
+    if Config.xsph_epsilon > 0 and N>0:
+        xsph_corr = xsph_corrections(new_vels, densities, grids)
+        for i in range(N):
+            new_vels[i] += xsph_corr[i]
+
+    for i in range(N):
+        velocities[i] = new_vels[i]
+        positions[i] += velocities[i] * Config.delta
+        resolve_collisions(positions[i], velocities[i])
+        draw_circle(win, get_color(velocities[i].length()), positions[i], Config.particle_size)
+
+
+def resolve_collisions(pos, vel):
+    if pos.x + Config.particle_size > Config.WIDTH:
+        pos.x = Config.WIDTH - Config.particle_size
+        vel.x *= -Config.collision_damping
+    if pos.x - Config.particle_size < 0:
+        pos.x = Config.particle_size
+        vel.x *= -Config.collision_damping
+    if pos.y + Config.particle_size > Config.HEIGHT:
+        pos.y = Config.HEIGHT - Config.particle_size
+        vel.y *= -Config.collision_damping
+    if pos.y - Config.particle_size < 0:
+        pos.y = Config.particle_size
+        vel.y *= -Config.collision_damping
+
+def draw_circle(win, color, pos, radius):
+    pygame.draw.circle(win, color, pos, radius)
+
+def start_cells(starting_pos=(Config.particle_size,Config.particle_size), spacing=2):
+    spacing = spacing + Config.particle_size*2
+    n_rows = int(math.sqrt(Config.num_particles))
+    for rows in range(n_rows):
+        x = starting_pos[0] + rows*spacing
+        for cols in range(n_rows):
+            y = starting_pos[1] + cols*spacing
+            velocities.append(pygame.Vector2(0,0))
+            positions.append(pygame.Vector2(x,y))
+
+def start_single(starting_pos = (100,100), vel=(0,0)):
+    velocities.append(pygame.Vector2(vel))
+    positions.append(pygame.Vector2(starting_pos))
+
+def start_random():
+    for n in range(Config.num_particles):
+        x = random.randint(Config.particle_size, Config.WIDTH-Config.particle_size)
+        y = random.randint(Config.particle_size, Config.HEIGHT- Config.particle_size)
+        velocities.append(pygame.Vector2(0,0))
+        positions.append(pygame.Vector2(x,y))
+
+def reset_particles():
+    positions.clear()
+    velocities.clear()
+
+
+def get_color(vel):
+    speed = min(vel/Config.max_speed, 1)
+    r, g, b, a = cmap(speed)
+    return (int(255*r), int(255*g), int(255*b))
+
+def clamp_velocity(v, max_speed):
+    speed = v.length()
+    if speed > max_speed:
+        return v.normalize() * max_speed
+    return v
+
+
+def xsph_corrections(candidate_vels, densities, grids):
+    """Compute XSPH velocity mixing corrections for candidate velocities.
+    Returns a list of Vector2 corrections to add to each candidate velocity.
+    """
+    N = len(candidate_vels)
+    eps = Config.xsph_epsilon
+    if eps <= 0 or N == 0:
+        return [pygame.Vector2(0,0) for _ in range(N)]
+
+    corrections = [pygame.Vector2(0,0) for _ in range(N)]
+    for i in range(N):
+        pos_i = positions[i]
+        vi = candidate_vels[i]
+        contrib = pygame.Vector2(0,0)
+        row, col = look_up_grid(pos_i)
+        for dr in (-1,0,1):
+            for dc in (-1,0,1):
+                r_cell = row + dr
+                c_cell = col + dc
+                if 0<= r_cell < grid_cols and 0<=c_cell < grid_rows:
+                    for j in grids[r_cell][c_cell]:
+                        if j == i: continue
+                        r = (pos_i - positions[j]).length()
+                        if r > Config.smoothing_radius: continue
+                        w = smoothing_kernel(r, Config.smoothing_radius)
+                        contrib += (candidate_vels[j] - vi) * (Config.mass / max(densities[j], 1e-8)) * w
+        corrections[i] = contrib * eps
+    return corrections
+
+
+def interaction_force(input_pos, radius, strength, particle_index):
+    interaction_force = pygame.Vector2((0,0))
+    offset = pygame.Vector2(input_pos) - positions[particle_index]
+    sqr_dst = offset.dot(offset)
+    if (sqr_dst < radius*radius):
+        dst = math.sqrt(sqr_dst)
+        dir_to_point = offset/dst
+        centerT = 1-dst/radius
+        interaction_force += (dir_to_point * strength - velocities[particle_index] * centerT)
+    return interaction_force
+
+
+class Outlet:
+    def __init__(self, pos, speed):
+        self.pos = pos
+        self.speed = speed
+        self._accum = 0.0
+
+    def spawn_particle(self, dt):
+        rate = Config.outlet_num_particles * 15
+        self._accum += rate * dt
+        while self._accum >= 1.0:
+            self._accum -= 1.0
+            vel = self.speed
+            if Config.outlet_spray:
+                angle = random.uniform(-math.pi / 8, math.pi / 8)
+                vel = vel.rotate_rad(angle)
+            velocities.append(pygame.Vector2(vel))
+            positions.append(pygame.Vector2(self.pos))
+
+    def draw(self, win, radius=10, col=(255,255,255)):
+        pygame.draw.circle(win, col, self.pos, radius, 2)
+        pygame.draw.line(win, col, self.pos, self.pos + self.speed.normalize()*radius, 2)
+
+class Drain:
+    def __init__(self, pos, radius):
+        self.pos = pos
+        self.radius = radius
+        self.grid_pos = look_up_grid(self.pos)
+
+    def pull_particles(self):
+        for i in range(len(positions)-1, -1, -1):
+            r_vec = positions[i] - self.pos
+            dist = r_vec.length()
+            if dist == 0: continue
+            if dist > Config.interaction_radius: continue
+            a = Config.drain_strength * self.radius**2 / dist**2
+            velocities[i] -= r_vec.normalize() * a * Config.delta
+            if Config.delete_particles_in_drain and dist <= self.radius:
+                positions.pop(i)
+                velocities.pop(i)
+
+    def draw(self, win, col=(100,100,100)):
+        pygame.draw.circle(win, col, self.pos, int(self.radius), 2)
+
+def update_drains(win):
+    if not Config.drains_paused:
+        for drain in drains:
+            drain.pull_particles()
+            drain.draw(win)
+    else:
+        for drain in drains:
+            drain.draw(win)
+
+def add_drain(pos:pygame.Vector2, mouse_pos:pygame.Vector2):
+    radius = mouse_pos - pos
+    drains.append(Drain(pos, radius.length()))
+
+def update_outlets(win, dt):
+    if not Config.outlets_paused and Config.delta != 0:
+        for outlet in outlets:
+            outlet.spawn_particle(dt)
+            outlet.draw(win)
+    else:
+        for outlet in outlets:
+            outlet.draw(win)
+
+def add_outlet(pos:pygame.Vector2, mouse_pos:pygame.Vector2):
+    direction = mouse_pos - pos
+    outlets.append(Outlet(pos, direction))
+
+def clear_outlets_drains():
+    outlets.clear()
+    drains.clear()
